@@ -1,0 +1,35 @@
+# Android/Gradle
+.gradle/
+**/build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Rust
+**/target/
+
+# Generated native binaries and bindings
+app/src/main/jniLibs/
+
+# IDE/OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Signing and secrets
+*.jks
+*.keystore
+keystore.properties
+*.pem
+*.key
+.env
+.env.*
+
+# Password-vault material and plaintext exports
+*.kdb
+*.kdbx
+*.fpass
+*.csv
+fosspass-export*.json

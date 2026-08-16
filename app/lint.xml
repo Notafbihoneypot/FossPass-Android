@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!-- UniFFI generated cleaner reflectively checks API availability before use. -->
+    <issue id="NewApi">
+        <ignore path="src/main/java/uniffi/fosspass_core/fosspass_core.kt" />
+    </issue>
+</lint>

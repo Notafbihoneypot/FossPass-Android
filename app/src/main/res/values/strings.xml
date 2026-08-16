@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FossPass</string>
+    <string name="strength_format">Strength: %1$s (%2$d/100)</string>
+</resources>

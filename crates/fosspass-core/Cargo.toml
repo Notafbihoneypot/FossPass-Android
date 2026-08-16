@@ -1,0 +1,32 @@
+[package]
+name = "fosspass-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fosspass_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+rand_core = { version = "0.6", features = ["getrandom"] }
+argon2 = "0.5"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+walkdir = "2"
+thiserror = "1"
+zeroize = "1"
+sha2 = "0.10"
+uniffi = { version = "0.28", features = ["tokio", "cli"] }
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+keepass = "0.13.20"
+
+[dev-dependencies]
+keepass = { version = "0.13.20", features = ["save_kdbx4"] }
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }

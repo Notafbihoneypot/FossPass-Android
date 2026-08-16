@@ -1,0 +1,61 @@
+namespace fosspass {
+    void init_vault([ByRef] string vault_path, [ByRef] string master_password);
+    UnlockedVault unlock_vault([ByRef] string vault_path, [ByRef] string master_password);
+};
+
+interface UnlockedVault {
+    [Throws=VaultError]
+    sequence<PublicEntry> list_entries();
+
+    [Throws=VaultError]
+    void add_entry(AddEntryRequest req);
+
+    [Throws=VaultError]
+    void delete_entry([ByRef] string entry_id);
+
+    [Throws=VaultError]
+    string export_android_compatible_bundle([ByRef] string passphrase, [ByRef] string file_type);
+
+    [Throws=VaultError]
+    ImportReport import_android_compatible_bundle([ByRef] string bundle_json, [ByRef] string passphrase);
+};
+
+dictionary AddEntryRequest {
+    string title;
+    string username;
+    string password;
+    string url;
+    string notes;
+};
+
+dictionary PublicEntry {
+    string entry_id;
+    string title;
+    string username;
+    string password;
+    string url;
+    string notes;
+    boolean favorite;
+    string updated_at;
+    i64 revision;
+};
+
+dictionary ImportReport {
+    string bundle_id;
+    u32 imported_entries;
+    u32 imported_tombstones;
+    u32 conflicts;
+};
+
+[Error]
+enum VaultError {
+    "Io",
+    "Json",
+    "Crypto",
+    "VaultExists",
+    "VaultNotFound",
+    "InvalidVaultFile",
+    "InvalidSyncBundle",
+    "SyncReplay",
+    "WrongVault",
+};
