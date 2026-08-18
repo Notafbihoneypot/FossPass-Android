@@ -7,12 +7,67 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.DecodeHintType;
+import com.google.zxing.EncodeHintType;
+import com.google.zxing.MultiFormatReader;
+import com.google.zxing.RGBLuminanceSource;
+import com.google.zxing.Result;
+import com.google.zxing.common.BitMatrix;
+import com.google.zxing.common.HybridBinarizer;
+import com.google.zxing.qrcode.QRCodeWriter;
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel;
 
 import org.json.JSONObject;
 import org.junit.Test;
 
 public class QrSyncRegressionTest {
+    @Test
+    public void scannerUsesQrOnlyTryHarderAndInvertedDecodeHints() {
+        Map<DecodeHintType, ?> hints = QrSyncSupport.qrDecodeHints();
+        assertEquals(Boolean.TRUE, hints.get(DecodeHintType.TRY_HARDER));
+        assertEquals(Boolean.TRUE, hints.get(DecodeHintType.ALSO_INVERTED));
+        assertTrue(((Collection<?>) hints.get(DecodeHintType.POSSIBLE_FORMATS))
+                .contains(BarcodeFormat.QR_CODE));
+    }
+
+    @Test
+    public void cameraReadableFrameRoundTripsThroughTheAndroidDecoder() throws Exception {
+        String bundle = "{\"type\":\"fosspass-qr-sync-v1\",\"ciphertext\":\""
+                + "x".repeat(2_000) + "\"}";
+        String frame = QrSyncSupport.splitAndroidBundle(bundle, 600, "camera-test").get(0);
+        Map<EncodeHintType, Object> encodeHints = new HashMap<>();
+        encodeHints.put(EncodeHintType.ERROR_CORRECTION, ErrorCorrectionLevel.M);
+        encodeHints.put(EncodeHintType.MARGIN, 2);
+        BitMatrix matrix = new QRCodeWriter().encode(
+                frame, BarcodeFormat.QR_CODE, 640, 640, encodeHints);
+        int[] pixels = new int[640 * 640];
+        for (int y = 0; y < 640; y++) {
+            for (int x = 0; x < 640; x++) {
+                pixels[y * 640 + x] = matrix.get(x, y) ? 0xff000000 : 0xffffffff;
+            }
+        }
+        BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(
+                new RGBLuminanceSource(640, 640, pixels)));
+        MultiFormatReader reader = new MultiFormatReader();
+        reader.setHints(QrSyncSupport.qrDecodeHints());
+        Result decoded = reader.decodeWithState(bitmap);
+        assertEquals(frame, decoded.getText());
+    }
+
+    @Test
+    public void scannerFeedbackDistinguishesLookingDetectedAndComplete() {
+        assertTrue(QrSyncSupport.scannerFeedback(0, 0).contains("Camera active"));
+        assertTrue(QrSyncSupport.scannerFeedback(2, 5).contains("2 / 5"));
+        assertTrue(QrSyncSupport.scannerFeedback(5, 5).contains("complete"));
+    }
+
     @Test
     public void externalScannerFlowDoesNotLockVaultWhenUiIsHidden() {
         assertFalse(QrSyncSupport.shouldLockForTrimMemory(true, android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN));

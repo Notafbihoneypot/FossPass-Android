@@ -24,9 +24,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            apks/FossPass-0.4.0-alpha-sync-storage-arm64-debug.apk \
+            apks/FossPass-0.4.1-alpha-qr-scanner-arm64-debug.apk \
             apks/SHA256SUMS \
             --verify-tag \
             --prerelease \
-            --title "FossPass 0.4.0 alpha — encrypted sync and storage picker" \
-            --notes "Android arm64-v8a prerelease. Debug-signed for testing only. Adds a database-location picker, compressed Android/Qubes sync, one-scan QR collection, and hardened lifecycle handling."
+            --title "FossPass 0.4.1 alpha — reliable Android QR scanner" \
+            --notes "Android arm64-v8a prerelease. Debug-signed for testing only. Adds a live camera heartbeat, QR detection and collection progress, haptic frame confirmation, QR-only try-harder/inverted decoding, and slower lower-density animated frames."

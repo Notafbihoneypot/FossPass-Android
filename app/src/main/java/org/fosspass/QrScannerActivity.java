@@ -9,6 +9,7 @@ import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Size;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -51,6 +52,8 @@ public class QrScannerActivity extends AppCompatActivity {
     private boolean finished = false;
     private String lastStatus = "";
     private long lastStatusAtMs;
+    private long lastHeartbeatAtMs;
+    private long analyzedFrameCount;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -60,7 +63,7 @@ public class QrScannerActivity extends AppCompatActivity {
         cameraLayout.addView(previewView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         scannerStatus = new TextView(this);
-        scannerStatus.setText("Point at the FossPass QR once and hold still");
+        scannerStatus.setText("Starting camera…");
         scannerStatus.setTextColor(Color.WHITE);
         scannerStatus.setBackgroundColor(0xB3000000);
         scannerStatus.setGravity(Gravity.CENTER);
@@ -71,6 +74,7 @@ public class QrScannerActivity extends AppCompatActivity {
         statusParams.setMargins(24, 24, 24, 48);
         cameraLayout.addView(scannerStatus, statusParams);
         setContentView(cameraLayout);
+        qrReader.setHints(QrSyncSupport.qrDecodeHints());
         cameraExecutor = Executors.newSingleThreadExecutor();
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera();
         else ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, PERMISSION_REQUEST_CAMERA);
@@ -95,11 +99,19 @@ public class QrScannerActivity extends AppCompatActivity {
         analysis.setAnalyzer(cameraExecutor, this::decodeImage);
         provider.unbindAll();
         provider.bindToLifecycle(this, selector, preview, analysis);
+        showScannerStatus(QrSyncSupport.scannerFeedback(0, 0));
     }
 
     private void decodeImage(ImageProxy image) {
         try {
             if (finished || image.getFormat() != ImageFormat.YUV_420_888 || image.getPlanes().length < 1) return;
+            analyzedFrameCount++;
+            long now = SystemClock.elapsedRealtime();
+            if (frameCollector.scannedCount() == 0 && now - lastHeartbeatAtMs >= 1_000) {
+                lastHeartbeatAtMs = now;
+                showScannerStatus(QrSyncSupport.scannerFeedback(0, 0)
+                        + " · camera frames checked: " + analyzedFrameCount);
+            }
             ImageProxy.PlaneProxy yPlane = image.getPlanes()[0];
             ByteBuffer yBuffer = yPlane.getBuffer();
             byte[] paddedY = new byte[yBuffer.remaining()];
@@ -112,11 +124,16 @@ public class QrScannerActivity extends AppCompatActivity {
             BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
             Result result = qrReader.decodeWithState(bitmap);
             String raw = result.getText();
-            if (raw != null && raw.trim().startsWith("{")) handleQr(raw);
+            if (raw != null && raw.trim().startsWith("{")) {
+                showScannerStatus("QR detected — checking encrypted FossPass data…");
+                handleQr(raw);
+            } else if (raw != null) {
+                showScannerStatus("QR detected, but it is not a FossPass QR");
+            }
         } catch (NotFoundException ignored) {
-            // Normal: most frames do not contain a readable QR.
-        } catch (Exception ignored) {
-            // Keep scanning; malformed frames should not crash the scanner.
+            // Normal: the live heartbeat confirms frames are still being analyzed.
+        } catch (Exception error) {
+            showScannerStatus("Camera active — QR seen but not readable yet; hold steady");
         } finally {
             qrReader.reset();
             image.close();
@@ -127,6 +144,8 @@ public class QrScannerActivity extends AppCompatActivity {
         JSONObject object = new JSONObject(raw);
         switch (QrSyncSupport.classifyScannedQr(object)) {
             case ANDROID_BUNDLE:
+                showScannerStatus(QrSyncSupport.scannerFeedback(1, 1));
+                hapticConfirmation();
                 returnQr(raw);
                 return;
             case DESKTOP_ONLY_FRAME:
@@ -143,12 +162,20 @@ public class QrScannerActivity extends AppCompatActivity {
         int before = frameCollector.scannedCount();
         String complete = frameCollector.add(raw);
         if (complete != null) {
+            showScannerStatus(QrSyncSupport.scannerFeedback(
+                    frameCollector.scannedCount(), frameCollector.expectedCount()));
+            hapticConfirmation();
             returnQr(complete);
         } else if (frameCollector.scannedCount() > before) {
             int scanned = frameCollector.scannedCount();
             int expected = frameCollector.expectedCount();
-            showScannerStatus("Scanning animated QR: " + scanned + " / " + expected);
+            showScannerStatus(QrSyncSupport.scannerFeedback(scanned, expected));
+            hapticConfirmation();
         }
+    }
+
+    private void hapticConfirmation() {
+        runOnUiThread(() -> previewView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY));
     }
 
     private void showScannerStatus(String message) {

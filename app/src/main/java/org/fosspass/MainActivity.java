@@ -104,7 +104,8 @@ public class MainActivity extends AppCompatActivity {
     private static final int CLIPBOARD_CLEAR_MS = 30_000;
     private static final long EXTERNAL_FLOW_TIMEOUT_MS = 120_000L;
     private static final long FIDO_SECRET_TIMEOUT_MS = 60_000L;
-    private static final long QR_ANIMATION_MS = 650L;
+    private static final long QR_ANIMATION_MS = 1_200L;
+    private static final int QR_FRAME_CHUNK_CHARS = 600;
     private static final int SINGLE_QR_MAX_CHARS = 1_800;
     private static final int REQ_QR_SCAN = 2401;
     private static final int REQ_IMPORT_PASSWORDS = 2402;
@@ -1365,7 +1366,7 @@ public class MainActivity extends AppCompatActivity {
                             frames.add(b);
                         } else {
                             frames = QrSyncSupport.splitAndroidBundle(
-                                    b, 1_000, UUID.randomUUID().toString());
+                                    b, QR_FRAME_CHUNK_CHARS, UUID.randomUUID().toString());
                         }
                         handler.post(() -> {
                             if (!operationGuard.isGenerationCurrent(generation) || rustVault != vault) return;

@@ -2,11 +2,16 @@ package org.fosspass;
 
 import android.content.ComponentCallbacks2;
 
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.DecodeHintType;
+
 import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -14,6 +19,25 @@ import java.util.Map;
 
 final class QrSyncSupport {
     private QrSyncSupport() {}
+
+    static Map<DecodeHintType, ?> qrDecodeHints() {
+        EnumMap<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+        hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
+        hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
+        hints.put(DecodeHintType.ALSO_INVERTED, Boolean.TRUE);
+        hints.put(DecodeHintType.CHARACTER_SET, "UTF-8");
+        return Collections.unmodifiableMap(hints);
+    }
+
+    static String scannerFeedback(int scanned, int expected) {
+        if (expected > 0 && scanned >= expected) {
+            return "QR collection complete — preparing encrypted import";
+        }
+        if (scanned > 0 && expected > 0) {
+            return "QR detected — receiving encrypted vault: " + scanned + " / " + expected;
+        }
+        return "Camera active — looking for FossPass QR";
+    }
 
     enum ScannedQrKind {
         ANDROID_FRAME,

@@ -2,14 +2,14 @@
 
 Offline-first encrypted Android password vault with Qubes interoperability.
 
-Current build: `0.4.0-alpha-sync-storage` (`versionCode 6`).
+Current build: `0.4.1-alpha-qr-scanner` (`versionCode 7`).
 
 ## Download
 
 - Architecture: Android `arm64-v8a`
 - Signing: debug/test key — prerelease testing only
-- APK: [FossPass 0.4.0 alpha](apks/FossPass-0.4.0-alpha-sync-storage-arm64-debug.apk)
-- SHA-256: `45f1840590c653e246a3285ea49cfd576fca5c8cf698bc53383276b8b217562b`
+- APK: [FossPass 0.4.1 alpha](apks/FossPass-0.4.1-alpha-qr-scanner-arm64-debug.apk)
+- SHA-256: `5c5b4b2a214a6cafc367a7c8adea5621f991c98b7934f75a160b846b6bd18df1`
 
 > This is a debug-signed alpha build. Do not treat it as a production release. A production APK must be signed with a protected release key and tested on physical devices.
 
@@ -17,7 +17,7 @@ Current build: `0.4.0-alpha-sync-storage` (`versionCode 6`).
 
 - Rust/UniFFI vault core using Argon2id and XChaCha20-Poly1305.
 - Vault create, unlock, master-password change, entries, imports, exports, and encrypted QR sync.
-- One direct QR for small encrypted bundles and one automatically changing QR tile for large vaults.
+- One direct QR for small encrypted bundles and one automatically changing QR tile for large vaults, with live Android camera heartbeat, QR detection, haptic frame confirmation, and collection progress.
 - `BIOMETRIC_STRONG`, FIDO2 roaming-key support, `FLAG_SECURE`, clipboard sensitivity metadata, and automatic clipboard clearing.
 - StrongBox-backed encrypted preferences when verified; encrypted Android Keystore fallback when StrongBox is unavailable. The app fails closed if encrypted preferences cannot initialize.
 - Persistent exponential unlock throttling capped at 60 seconds.
