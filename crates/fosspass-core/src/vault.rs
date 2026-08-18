@@ -6,6 +6,7 @@ use argon2::Argon2;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chacha20poly1305::{aead::OsRng, XChaCha20Poly1305, XNonce};
 use chrono::Utc;
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use keepass::{
     db::{fields, GroupId, GroupRef},
     Database, DatabaseKey,
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs,
-    io::Cursor,
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -298,6 +299,8 @@ struct AndroidCompatBundle {
     r#type: String,
     #[serde(default)]
     version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compression: Option<String>,
     salt: String,
     iv: String,
     ciphertext: String,
@@ -604,7 +607,8 @@ fn export_android_compatible_bundle_internal(
             favorite: e.favorite,
         })
         .collect::<Vec<_>>();
-    encrypt_android_compat_json(&serde_json::to_string(&entries)?, passphrase, file_type)
+    let plain_json = Zeroizing::new(serde_json::to_string(&entries)?);
+    encrypt_android_compat_json(plain_json.as_str(), passphrase, file_type)
 }
 
 fn import_android_compatible_bundle_internal(
@@ -612,8 +616,8 @@ fn import_android_compatible_bundle_internal(
     bundle_json: &str,
     passphrase: &str,
 ) -> Result<ImportReport, VaultError> {
-    let plain = decrypt_android_compat_json(bundle_json, passphrase)?;
-    let incoming: Vec<AndroidCompatEntry> = serde_json::from_str(&plain)?;
+    let plain = Zeroizing::new(decrypt_android_compat_json(bundle_json, passphrase)?);
+    let incoming: Vec<AndroidCompatEntry> = serde_json::from_str(plain.as_str())?;
     let bundle_id = Uuid::new_v4().to_string();
     let existing_tombstones = tombstones(&unlocked.root, &unlocked.key)?;
     let mut duplicate_keys: HashSet<_> = list_entries_internal(unlocked)?
@@ -805,19 +809,31 @@ fn encrypt_android_compat_json(
     a.hash_password_into(passphrase.as_bytes(), &salt, key.as_mut())
         .map_err(|_| VaultError::Crypto)?;
 
+    let plain = Zeroizing::new(plain_json.as_bytes().to_vec());
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(plain.as_ref())
+        .map_err(|_| VaultError::InvalidSyncBundle)?;
+    let compressed = Zeroizing::new(
+        encoder
+            .finish()
+            .map_err(|_| VaultError::InvalidSyncBundle)?,
+    );
+    let aad = format!("fosspass-sync-envelope-v3\0{file_type}\0zlib");
     let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| VaultError::Crypto)?;
     let ciphertext = cipher
         .encrypt(
             AesNonce::from_slice(&iv),
             aes_gcm::aead::Payload {
-                msg: plain_json.as_bytes(),
-                aad: file_type.as_bytes(),
+                msg: compressed.as_ref(),
+                aad: aad.as_bytes(),
             },
         )
         .map_err(|_| VaultError::Crypto)?;
     let out = AndroidCompatBundle {
         r#type: file_type.to_string(),
-        version: Some(2),
+        version: Some(3),
+        compression: Some("zlib".into()),
         salt: B64.encode(salt),
         iv: B64.encode(iv),
         ciphertext: B64.encode(ciphertext),
@@ -826,6 +842,8 @@ fn encrypt_android_compat_json(
 }
 
 fn decrypt_android_compat_json(bundle_json: &str, passphrase: &str) -> Result<String, VaultError> {
+    const MAX_DECOMPRESSED_BYTES: u64 = 20 * 1024 * 1024;
+
     let bundle: AndroidCompatBundle = serde_json::from_str(bundle_json.trim())?;
     if bundle.r#type != "fosspass-qr-sync-v1" && bundle.r#type != "fosspass-vault-file-v1" {
         return Err(VaultError::InvalidSyncBundle);
@@ -856,19 +874,59 @@ fn decrypt_android_compat_json(bundle_json: &str, passphrase: &str) -> Result<St
         .map_err(|_| VaultError::Crypto)?;
 
     let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| VaultError::Crypto)?;
-    let plain = match bundle.version {
-        Some(2) => cipher.decrypt(
-            AesNonce::from_slice(&iv),
-            aes_gcm::aead::Payload {
-                msg: ciphertext.as_ref(),
-                aad: bundle.r#type.as_bytes(),
-            },
-        ),
-        None => cipher.decrypt(AesNonce::from_slice(&iv), ciphertext.as_ref()),
-        _ => return Err(VaultError::InvalidSyncBundle),
-    }
-    .map_err(|_| VaultError::Crypto)?;
-    String::from_utf8(plain).map_err(|_| VaultError::InvalidSyncBundle)
+    let plain = Zeroizing::new(
+        match bundle.version {
+            Some(3) => {
+                if bundle.compression.as_deref() != Some("zlib") {
+                    return Err(VaultError::InvalidSyncBundle);
+                }
+                let aad = format!("fosspass-sync-envelope-v3\0{}\0zlib", bundle.r#type);
+                cipher.decrypt(
+                    AesNonce::from_slice(&iv),
+                    aes_gcm::aead::Payload {
+                        msg: ciphertext.as_ref(),
+                        aad: aad.as_bytes(),
+                    },
+                )
+            }
+            Some(2) => {
+                if bundle.compression.is_some() {
+                    return Err(VaultError::InvalidSyncBundle);
+                }
+                cipher.decrypt(
+                    AesNonce::from_slice(&iv),
+                    aes_gcm::aead::Payload {
+                        msg: ciphertext.as_ref(),
+                        aad: bundle.r#type.as_bytes(),
+                    },
+                )
+            }
+            None => {
+                if bundle.compression.is_some() {
+                    return Err(VaultError::InvalidSyncBundle);
+                }
+                cipher.decrypt(AesNonce::from_slice(&iv), ciphertext.as_ref())
+            }
+            _ => return Err(VaultError::InvalidSyncBundle),
+        }
+        .map_err(|_| VaultError::Crypto)?,
+    );
+
+    let decoded = if bundle.version == Some(3) {
+        let decoder = ZlibDecoder::new(plain.as_slice());
+        let mut limited = decoder.take(MAX_DECOMPRESSED_BYTES + 1);
+        let mut output = Zeroizing::new(Vec::new());
+        limited
+            .read_to_end(output.as_mut())
+            .map_err(|_| VaultError::InvalidSyncBundle)?;
+        if output.len() as u64 > MAX_DECOMPRESSED_BYTES {
+            return Err(VaultError::InvalidSyncBundle);
+        }
+        output
+    } else {
+        plain
+    };
+    String::from_utf8(decoded.to_vec()).map_err(|_| VaultError::InvalidSyncBundle)
 }
 
 fn find_entry_path_by_id(
@@ -1311,15 +1369,153 @@ mod tests {
     }
 
     #[test]
-    fn android_bundle_type_is_authenticated() {
-        let bundle = encrypt_android_compat_json(
-            "{\"entries\":[]}",
-            "bundle passphrase",
-            "fosspass-qr-sync-v1",
+    fn android_v3_bundle_round_trips_and_declares_compression() {
+        let plain = r#"[{"id":"1","title":"Example","username":"alice","password":"secret","url":"https://example.com","notes":"hello","updatedAt":"2026-08-16T00:00:00Z","favorite":false}]"#;
+        let bundle =
+            encrypt_android_compat_json(plain, "bundle passphrase", "fosspass-qr-sync-v1").unwrap();
+        let envelope: AndroidCompatBundle = serde_json::from_str(&bundle).unwrap();
+        assert_eq!(envelope.version, Some(3));
+        assert_eq!(envelope.compression.as_deref(), Some("zlib"));
+        assert_eq!(
+            decrypt_android_compat_json(&bundle, "bundle passphrase").unwrap(),
+            plain
+        );
+    }
+
+    fn old_android_bundle(plain: &str, version: Option<u32>) -> String {
+        let salt = [7u8; 16];
+        let iv = [9u8; 12];
+        let params = argon2::Params::new(
+            VAULT_KDF_MEMORY_KIB,
+            VAULT_KDF_ITERATIONS,
+            VAULT_KDF_PARALLELISM,
+            Some(32),
         )
         .unwrap();
+        let mut key = Zeroizing::new([0u8; 32]);
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+            .hash_password_into(b"old bundle passphrase", &salt, key.as_mut())
+            .unwrap();
+        let cipher = Aes256Gcm::new_from_slice(key.as_ref()).unwrap();
+        let ciphertext = match version {
+            Some(2) => cipher
+                .encrypt(
+                    AesNonce::from_slice(&iv),
+                    aes_gcm::aead::Payload {
+                        msg: plain.as_bytes(),
+                        aad: b"fosspass-qr-sync-v1",
+                    },
+                )
+                .unwrap(),
+            None => cipher
+                .encrypt(AesNonce::from_slice(&iv), plain.as_bytes())
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        serde_json::to_string(&AndroidCompatBundle {
+            r#type: "fosspass-qr-sync-v1".into(),
+            version,
+            compression: None,
+            salt: B64.encode(salt),
+            iv: B64.encode(iv),
+            ciphertext: B64.encode(ciphertext),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn android_import_still_accepts_v2_and_legacy_bundles() {
+        let plain = r#"[{"title":"old"}]"#;
+        for version in [Some(2), None] {
+            let bundle = old_android_bundle(plain, version);
+            assert_eq!(
+                decrypt_android_compat_json(&bundle, "old bundle passphrase").unwrap(),
+                plain
+            );
+        }
+    }
+
+    #[test]
+    fn android_v3_type_and_compression_are_authenticated() {
+        let bundle =
+            encrypt_android_compat_json("[]", "bundle passphrase", "fosspass-qr-sync-v1").unwrap();
         let relabeled = bundle.replace("fosspass-qr-sync-v1", "fosspass-vault-file-v1");
         assert!(decrypt_android_compat_json(&relabeled, "bundle passphrase").is_err());
+        let recompressed = bundle.replace("\"zlib\"", "\"gzip\"");
+        assert!(decrypt_android_compat_json(&recompressed, "bundle passphrase").is_err());
+    }
+
+    fn encrypted_v3_payload(payload: &[u8]) -> String {
+        let salt = [3u8; 16];
+        let iv = [4u8; 12];
+        let params = argon2::Params::new(
+            VAULT_KDF_MEMORY_KIB,
+            VAULT_KDF_ITERATIONS,
+            VAULT_KDF_PARALLELISM,
+            Some(32),
+        )
+        .unwrap();
+        let mut key = Zeroizing::new([0u8; 32]);
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+            .hash_password_into(b"bomb passphrase", &salt, key.as_mut())
+            .unwrap();
+        let cipher = Aes256Gcm::new_from_slice(key.as_ref()).unwrap();
+        let ciphertext = cipher
+            .encrypt(
+                AesNonce::from_slice(&iv),
+                aes_gcm::aead::Payload {
+                    msg: payload,
+                    aad: b"fosspass-sync-envelope-v3\0fosspass-qr-sync-v1\0zlib",
+                },
+            )
+            .unwrap();
+        serde_json::to_string(&AndroidCompatBundle {
+            r#type: "fosspass-qr-sync-v1".into(),
+            version: Some(3),
+            compression: Some("zlib".into()),
+            salt: B64.encode(salt),
+            iv: B64.encode(iv),
+            ciphertext: B64.encode(ciphertext),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn android_v3_rejects_decompression_bomb_over_20_mib() {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder
+            .write_all(&vec![b'x'; 20 * 1024 * 1024 + 1])
+            .unwrap();
+        let compressed = encoder.finish().unwrap();
+        let bundle = encrypted_v3_payload(&compressed);
+        assert!(decrypt_android_compat_json(&bundle, "bomb passphrase").is_err());
+    }
+
+    #[test]
+    fn android_v3_substantially_reduces_realistic_400_entry_bundle() {
+        let entries: Vec<_> = (0..400)
+            .map(|index| AndroidCompatEntry {
+                id: format!("00000000-0000-4000-8000-{index:012}"),
+                title: format!("Example Service {index}"),
+                username: format!("person{index}@example.com"),
+                password: format!("correct-horse-battery-staple-{index}"),
+                url: format!("https://accounts.example.com/service/{index}/login"),
+                notes: "Recovery contact: security@example.com; managed personal account".into(),
+                updated_at: "2026-08-16T12:34:56Z".into(),
+                favorite: index % 7 == 0,
+            })
+            .collect();
+        let plain = serde_json::to_string(&entries).unwrap();
+        let bundle =
+            encrypt_android_compat_json(&plain, "bundle passphrase", "fosspass-qr-sync-v1")
+                .unwrap();
+        let envelope: AndroidCompatBundle = serde_json::from_str(&bundle).unwrap();
+        let encrypted_len = B64.decode(envelope.ciphertext).unwrap().len();
+        assert!(
+            encrypted_len < plain.len() / 2,
+            "{encrypted_len} vs {}",
+            plain.len()
+        );
     }
 
     #[test]

@@ -15,6 +15,78 @@ import java.util.Map;
 final class QrSyncSupport {
     private QrSyncSupport() {}
 
+    enum ScannedQrKind {
+        ANDROID_FRAME,
+        ANDROID_BUNDLE,
+        DESKTOP_ONLY_FRAME,
+        UNSUPPORTED_FOSSPASS,
+        UNRELATED
+    }
+
+    static ScannedQrKind classifyScannedQr(JSONObject object) {
+        String type = object.optString("type");
+        if ("fosspass-android-qr-frame-v1".equals(type)) return ScannedQrKind.ANDROID_FRAME;
+        if ("fosspass-qr-sync-v1".equals(type) || "fosspass-vault-file-v1".equals(type)) {
+            return ScannedQrKind.ANDROID_BUNDLE;
+        }
+        if ("fosspass-qr-frame".equals(type)) return ScannedQrKind.DESKTOP_ONLY_FRAME;
+        if (type.startsWith("fosspass-")) return ScannedQrKind.UNSUPPORTED_FOSSPASS;
+        return ScannedQrKind.UNRELATED;
+    }
+
+    static boolean isStagedAndroidBundle(String raw) {
+        if (raw == null || raw.isEmpty() || raw.length() > PasswordImportReader.MAX_IMPORT_BYTES) return false;
+        try {
+            JSONObject bundle = new JSONObject(raw);
+            if (classifyScannedQr(bundle) != ScannedQrKind.ANDROID_BUNDLE) return false;
+            String salt = bundle.optString("salt", "");
+            String iv = bundle.optString("iv", "");
+            String ciphertext = bundle.optString("ciphertext", "");
+            if (!salt.matches("[A-Za-z0-9+/]{22}==")
+                    || !iv.matches("[A-Za-z0-9+/]{16}")
+                    || ciphertext.isEmpty()
+                    || !ciphertext.matches("[A-Za-z0-9+/]+={0,2}")) return false;
+            if (!bundle.has("version")) return !bundle.has("compression");
+            int version = bundle.optInt("version", -1);
+            if (version == 2) return !bundle.has("compression");
+            return version == 3 && "zlib".equals(bundle.optString("compression"));
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    static String requireCompleteAndroidBundle(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            throw new IllegalArgumentException("No encrypted Android bundle was supplied");
+        }
+        String trimmed = raw.trim();
+        try {
+            JSONObject object = new JSONObject(trimmed);
+            ScannedQrKind kind = classifyScannedQr(object);
+            if (kind == ScannedQrKind.ANDROID_FRAME) {
+                throw new IllegalArgumentException(
+                        "This is only one animated frame. Use Scan QR and keep the camera pointed until collection finishes.");
+            }
+            if (kind == ScannedQrKind.DESKTOP_ONLY_FRAME) {
+                throw new IllegalArgumentException(
+                        "This is a desktop-only vault-key QR. On desktop choose Sync with Android.");
+            }
+            if (kind != ScannedQrKind.ANDROID_BUNDLE || !isStagedAndroidBundle(trimmed)) {
+                throw new IllegalArgumentException("Unsupported or incomplete Android sync bundle");
+            }
+            return trimmed;
+        } catch (IllegalArgumentException error) {
+            throw error;
+        } catch (Exception error) {
+            throw new IllegalArgumentException("Android sync data is not valid JSON", error);
+        }
+    }
+
+    static int nextFrameIndex(int currentIndex, int frameCount) {
+        if (frameCount < 1) return 0;
+        return (Math.max(0, currentIndex) + 1) % frameCount;
+    }
+
     static boolean shouldLockForTrimMemory(boolean externalFlowInProgress, int level) {
         return !externalFlowInProgress && level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN;
     }

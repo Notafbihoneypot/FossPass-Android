@@ -24,6 +24,7 @@ uniffi = { version = "0.28", features = ["tokio", "cli"] }
 aes-gcm = "0.10"
 pbkdf2 = "0.12"
 keepass = "0.13.20"
+flate2 = "1"
 
 [dev-dependencies]
 keepass = { version = "0.13.20", features = ["save_kdbx4"] }

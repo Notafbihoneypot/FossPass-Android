@@ -1,6 +1,6 @@
 # FossPass Android
 
-Current build: `0.3.1-alpha-keepass` (`versionCode 5`).
+Current build: `0.4.0-alpha-sync-storage` (`versionCode 6`).
 
 ## Implemented
 
@@ -10,6 +10,7 @@ Current build: `0.3.1-alpha-keepass` (`versionCode 5`).
 - StrongBox-backed encrypted preferences when verified; encrypted Android Keystore fallback when StrongBox is unavailable. The app fails closed if encrypted preferences cannot initialize.
 - Persistent exponential unlock throttling capped at 60 seconds.
 - Android Autofill Service with a 30-second in-memory handoff and a fresh `BIOMETRIC_STRONG` confirmation before one credential is released. Decrypted Autofill data is never persisted.
+- Choose the encrypted database location from the unlock screen: private internal storage (recommended) or app-scoped device storage. Locations remain separate encrypted vaults and switching does not copy records.
 - No `INTERNET` permission.
 
 ## Autofill workflow

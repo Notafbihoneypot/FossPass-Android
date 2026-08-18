@@ -16,25 +16,22 @@ final class VaultSession {
     private static UnlockedVault vault;
     private static long expiresAtElapsedMs;
     private static long generation;
+    private static boolean entriesClaimed;
 
     private VaultSession() {}
-
-    static synchronized void activate(UnlockedVault unlockedVault) {
-        generation++;
-        vault = unlockedVault;
-        expiresAtElapsedMs = Long.MAX_VALUE;
-    }
 
     static synchronized void handoff(UnlockedVault unlockedVault, long durationMs) {
         long ticket = ++generation;
         long boundedDuration = Math.max(0L, durationMs);
         vault = unlockedVault;
+        entriesClaimed = false;
         expiresAtElapsedMs = SystemClock.elapsedRealtime() + boundedDuration;
         MAIN.postDelayed(() -> clearIfCurrent(ticket), boundedDuration);
     }
 
     static synchronized List<PublicEntry> entries() {
-        if (!valid()) return Collections.emptyList();
+        if (!valid() || entriesClaimed) return Collections.emptyList();
+        entriesClaimed = true;
         try {
             return vault.listEntries();
         } catch (Exception ignored) {
@@ -44,10 +41,13 @@ final class VaultSession {
     }
 
     static synchronized PublicEntry find(String entryId) {
-        if (!valid() || entryId == null) return null;
+        if (!valid() || !entriesClaimed || entryId == null) return null;
         try {
             for (PublicEntry entry : vault.listEntries()) {
-                if (entryId.equals(entry.getEntryId())) return entry;
+                if (entryId.equals(entry.getEntryId())) {
+                    clear();
+                    return entry;
+                }
             }
         } catch (Exception ignored) {
             clear();
@@ -58,11 +58,12 @@ final class VaultSession {
     static synchronized void clear() {
         generation++;
         vault = null;
+        entriesClaimed = false;
         expiresAtElapsedMs = 0L;
     }
 
     private static boolean valid() {
-        if (vault == null || SystemClock.elapsedRealtime() > expiresAtElapsedMs) {
+        if (vault == null || SystemClock.elapsedRealtime() >= expiresAtElapsedMs) {
             clear();
             return false;
         }

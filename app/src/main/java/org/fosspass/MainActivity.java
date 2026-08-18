@@ -76,6 +76,7 @@ import java.util.UUID;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 import javax.crypto.SecretKey;
 import javax.crypto.SecretKeyFactory;
@@ -101,6 +102,10 @@ public class MainActivity extends AppCompatActivity {
     private static final int CYAN = Color.rgb(79, 209, 197);
     private static final int RED = Color.rgb(255, 90, 90);
     private static final int CLIPBOARD_CLEAR_MS = 30_000;
+    private static final long EXTERNAL_FLOW_TIMEOUT_MS = 120_000L;
+    private static final long FIDO_SECRET_TIMEOUT_MS = 60_000L;
+    private static final long QR_ANIMATION_MS = 650L;
+    private static final int SINGLE_QR_MAX_CHARS = 1_800;
     private static final int REQ_QR_SCAN = 2401;
     private static final int REQ_IMPORT_PASSWORDS = 2402;
     private static final int REQ_EXPORT_PASSWORDS = 2403;
@@ -137,12 +142,17 @@ public class MainActivity extends AppCompatActivity {
     private String pendingExportFormat = "csv";
     private String pendingSyncPassphrase = "";
     private String lastBundleJson = "";
+    private String pendingEncryptedQrBundle = "";
+    private long pendingEncryptedQrExpiresAtMs;
     private List<String> qrExportFrames = new ArrayList<>();
     private int qrExportIndex = 0;
-    private byte[] pendingFidoChallenge = null;
-    private String pendingUnlockPassword = null;
+    private Runnable qrExportAnimation;
     private boolean pendingCreateVault = false;
-    private boolean externalFlowInProgress = false;
+    private long pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+    private long pendingFidoRegistrationToken = LifecycleOperationGuard.INVALID_TOKEN;
+    private final LifecycleOperationGuard operationGuard = new LifecycleOperationGuard();
+    private final ExternalFlowState externalFlow = new ExternalFlowState();
+    private final FidoPendingSecrets fidoSecrets = new FidoPendingSecrets();
 
     private final BroadcastReceiver screenOffReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -168,40 +178,113 @@ public class MainActivity extends AppCompatActivity {
     @Override protected void onStop() {
         super.onStop();
         try { unregisterReceiver(screenOffReceiver); } catch (IllegalArgumentException ignored) {}
-        if (!externalFlowInProgress) lockForAutofillHandoff();
+        lockForBackgroundTransition();
+    }
+
+    private void lockForBackgroundTransition() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        ExternalFlowState.Type flow = externalFlow.current(now);
+        boolean validFido = ExternalFlowState.mayRetainFidoSecrets(flow)
+                && fidoSecrets.hasPending(now)
+                && ((flow == ExternalFlowState.Type.FIDO_ASSERTION
+                    && operationGuard.isCurrent(pendingUnlockToken, LifecycleOperationGuard.Kind.UNLOCK))
+                    || (flow == ExternalFlowState.Type.FIDO_REGISTRATION
+                    && operationGuard.isCurrent(pendingFidoRegistrationToken,
+                            LifecycleOperationGuard.Kind.FIDO_REGISTRATION)));
+        if (validFido) {
+            // Keep only the typed, expiring FIDO continuation; lock all live vault/UI state.
+            VaultSession.clear();
+            clearUnlockedState(true);
+        } else if (flow == ExternalFlowState.Type.AUTOFILL_HANDOFF) {
+            operationGuard.invalidate();
+            fidoSecrets.clear(FidoPendingSecrets.CleanupReason.ON_STOP);
+            clearUnlockedState(false);
+        } else {
+            lock();
+        }
     }
 
     @Override public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (QrSyncSupport.shouldLockForTrimMemory(externalFlowInProgress, level)) lock();
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            lockForBackgroundTransition();
+        }
+    }
+
+    @Override protected void onDestroy() {
+        operationGuard.destroy();
+        fidoSecrets.clear(FidoPendingSecrets.CleanupReason.DESTRUCTION);
+        externalFlow.clear();
+        VaultSession.clear();
+        pendingEncryptedQrBundle = "";
+        pendingEncryptedQrExpiresAtMs = 0L;
+        rustVault = null;
+        entries.clear();
+        handler.removeCallbacksAndMessages(null);
+        ioExecutor.shutdownNow();
+        super.onDestroy();
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        externalFlowInProgress = false;
+        if (requestCode == REQ_QR_SCAN && resultCode == RESULT_OK && data != null) {
+            String scanned = data.getStringExtra(QrScannerActivity.EXTRA_QR_VALUE);
+            if (QrSyncSupport.isStagedAndroidBundle(scanned)) {
+                pendingEncryptedQrBundle = scanned;
+                pendingEncryptedQrExpiresAtMs = android.os.SystemClock.elapsedRealtime()
+                        + EXTERNAL_FLOW_TIMEOUT_MS;
+                externalFlow.clear();
+                status = "Encrypted QR captured; unlock and re-enter the sync passphrase to import";
+                if (securePrefs != null) renderUnlock();
+                toast("QR captured securely. Unlock to finish import.");
+            } else {
+                toast("Unsupported or incomplete Android sync QR");
+            }
+            return;
+        }
+        ExternalFlowState.Type expectedFlow = flowForRequest(requestCode);
+        if (expectedFlow != ExternalFlowState.Type.NONE
+                && !externalFlow.consume(expectedFlow, android.os.SystemClock.elapsedRealtime())) {
+            if (requestCode == REQ_FIDO_REGISTER || requestCode == REQ_FIDO_ASSERT) {
+                fidoSecrets.clear(FidoPendingSecrets.CleanupReason.INVALID_RESULT);
+                operationGuard.invalidate();
+                pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+                pendingFidoRegistrationToken = LifecycleOperationGuard.INVALID_TOKEN;
+                toast("Hardware-key result expired; retry unlock or enrollment");
+            } else {
+                toast("Vault locked while away; unlock and retry this action");
+            }
+            return;
+        }
         if (resultCode != RESULT_OK || data == null) {
-            if (requestCode == REQ_FIDO_REGISTER || requestCode == REQ_FIDO_ASSERT) toast("Hardware-key operation cancelled");
+            if (requestCode == REQ_FIDO_REGISTER || requestCode == REQ_FIDO_ASSERT) {
+                fidoSecrets.clear(FidoPendingSecrets.CleanupReason.CANCELLATION);
+                operationGuard.invalidate();
+                pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+                pendingFidoRegistrationToken = LifecycleOperationGuard.INVALID_TOKEN;
+                toast("Hardware-key operation cancelled");
+            }
             return;
         }
         if (requestCode == REQ_FIDO_REGISTER) {
             handleFidoRegistrationResult(data);
         } else if (requestCode == REQ_FIDO_ASSERT) {
             handleFidoAssertionResult(data);
-        } else if (requestCode == REQ_QR_SCAN) {
-            String scanned = data.getStringExtra(QrScannerActivity.EXTRA_QR_VALUE);
-            if (scanned != null) {
-                lastBundleJson = scanned;
-                status = "QR scanned; ready to import";
-                if (rustVault != null) {
-                    renderShell();
-                    showQrPanel();
-                }
-            }
         } else if (requestCode == REQ_IMPORT_PASSWORDS && data.getData() != null) {
             importPasswordFile(data.getData());
         } else if (requestCode == REQ_EXPORT_PASSWORDS && data.getData() != null) {
             exportPasswordFile(data.getData(), pendingExportFormat);
         }
+    }
+
+    private ExternalFlowState.Type flowForRequest(int requestCode) {
+        if (requestCode == REQ_FIDO_REGISTER) return ExternalFlowState.Type.FIDO_REGISTRATION;
+        if (requestCode == REQ_FIDO_ASSERT) return ExternalFlowState.Type.FIDO_ASSERTION;
+        if (requestCode == REQ_QR_SCAN) return ExternalFlowState.Type.QR_SCAN;
+        if (requestCode == REQ_IMPORT_PASSWORDS) return ExternalFlowState.Type.DOCUMENT_IMPORT;
+        if (requestCode == REQ_EXPORT_PASSWORDS) return ExternalFlowState.Type.DOCUMENT_EXPORT;
+        if (requestCode == 2601) return ExternalFlowState.Type.AUTOFILL_SETTINGS;
+        return ExternalFlowState.Type.NONE;
     }
 
     private boolean initSecurePrefs() {
@@ -262,12 +345,24 @@ public class MainActivity extends AppCompatActivity {
         return securePrefs.getString(PREF_VAULT_STORAGE, AndroidVaultStorage.INTERNAL);
     }
 
-    private void toggleVaultStorage() {
-        String next = AndroidVaultStorage.INTERNAL.equals(selectedStorageMode())
-                ? AndroidVaultStorage.DEVICE : AndroidVaultStorage.INTERNAL;
-        securePrefs.edit().putString(PREF_VAULT_STORAGE, next).apply();
-        applyVaultStorageSelection();
-        renderUnlock();
+    private void showVaultStoragePicker() {
+        String[] locations = {
+                "Private internal storage (recommended)",
+                "App-scoped device storage"
+        };
+        int[] selected = {AndroidVaultStorage.choiceForMode(selectedStorageMode())};
+        new AlertDialog.Builder(this)
+                .setTitle("Choose database location")
+                .setSingleChoiceItems(locations, selected[0],
+                        (dialog, which) -> selected[0] = which)
+                .setPositiveButton("Use Location", (dialog, which) -> {
+                    String mode = AndroidVaultStorage.modeForChoice(selected[0]);
+                    securePrefs.edit().putString(PREF_VAULT_STORAGE, mode).apply();
+                    applyVaultStorageSelection();
+                    renderUnlock();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private boolean verifyStrongBoxKey(String alias) throws Exception {
@@ -318,9 +413,7 @@ public class MainActivity extends AppCompatActivity {
                 deviceStorage
                         ? "App-scoped device storage. The vault remains encrypted, but ciphertext may be visible to a connected computer or privileged apps. Each location is a separate vault; switching does not copy data."
                         : "Private internal app storage (recommended). Android sandboxing and vault encryption both protect the database. Each location is a separate vault; switching does not copy data."));
-        Button storage = button(deviceStorage
-                ? "Use Private Internal Storage"
-                : "Use Device Storage", false);
+        Button storage = button("Choose Database Location", false);
         card.addView(storage);
 
         EditText pass = input("Master password", "", true);
@@ -340,7 +433,7 @@ public class MainActivity extends AppCompatActivity {
 
         create.setOnClickListener(v -> handleUnlock(pass, true));
         open.setOnClickListener(v -> handleUnlock(pass, false));
-        storage.setOnClickListener(v -> toggleVaultStorage());
+        storage.setOnClickListener(v -> showVaultStoragePicker());
 
         outer.addView(card, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -361,30 +454,42 @@ public class MainActivity extends AppCompatActivity {
         String p = pass.getText().toString();
         if (p.isEmpty()) { toast("Enter password"); return; }
         pass.setText("");
-        if (!create && securePrefs.getBoolean(PREF_FIDO_ENABLED, false)) {
-            pendingUnlockPassword = p;
-            pendingCreateVault = false;
-            beginFidoAssertion();
+        long token = operationGuard.beginExclusive(LifecycleOperationGuard.Kind.UNLOCK);
+        if (token == LifecycleOperationGuard.INVALID_TOKEN) {
+            toast("Unlock already in progress");
             return;
         }
-        showBiometricPrompt(() -> finishPasswordUnlock(p, create));
+        pendingUnlockToken = token;
+        if (!create && securePrefs.getBoolean(PREF_FIDO_ENABLED, false)) {
+            pendingCreateVault = false;
+            beginFidoAssertion(p, token);
+            return;
+        }
+        showBiometricPrompt(() -> finishPasswordUnlock(p, create, token), () -> {
+            operationGuard.invalidate();
+            pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+        });
     }
 
-    private void finishPasswordUnlock(String password, boolean create) {
-        ioExecutor.execute(() -> {
+    private void finishPasswordUnlock(String password, boolean create, long token) {
+        executeIo(() -> {
             try {
+                if (!operationGuard.isCurrent(token, LifecycleOperationGuard.Kind.UNLOCK)) return;
                 if (create) Fosspass_coreKt.initVault(vaultPath, password);
-                rustVault = Fosspass_coreKt.unlockVault(vaultPath, password);
+                UnlockedVault unlocked = Fosspass_coreKt.unlockVault(vaultPath, password);
                 handler.post(() -> {
-                    pendingUnlockPassword = null;
+                    if (!operationGuard.completeIfCurrent(token, LifecycleOperationGuard.Kind.UNLOCK)) return;
+                    pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+                    rustVault = unlocked;
                     resetUnlockThrottle();
-                    VaultSession.activate(rustVault);
                     status = create ? "Vault Created" : "Unlocked";
                     loadEntries();
                 });
             } catch (Exception e) {
                 Log.e(TAG, "Unlock failed", e);
                 handler.post(() -> {
+                    if (!operationGuard.completeIfCurrent(token, LifecycleOperationGuard.Kind.UNLOCK)) return;
+                    pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
                     recordUnlockFailure();
                     toast("Unlock failed");
                 });
@@ -419,19 +524,39 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadEntries() {
-        if (rustVault == null) return;
-        ioExecutor.execute(() -> {
+        UnlockedVault vault = rustVault;
+        long generation = operationGuard.captureGeneration();
+        if (vault == null || generation == LifecycleOperationGuard.INVALID_TOKEN) return;
+        executeIo(() -> {
             try {
-                List<PublicEntry> list = rustVault.listEntries();
+                if (!operationGuard.isGenerationCurrent(generation)) return;
+                List<PublicEntry> list = vault.listEntries();
                 handler.post(() -> {
+                    if (!operationGuard.isGenerationCurrent(generation) || rustVault != vault) return;
                     entries.clear();
                     entries.addAll(list);
                     if (!entries.isEmpty() && selectedId == null) selectedId = entries.get(0).getEntryId();
-                    renderShell();
+                    long now = android.os.SystemClock.elapsedRealtime();
+                    boolean hasStagedQr = !pendingEncryptedQrBundle.isEmpty()
+                            && now < pendingEncryptedQrExpiresAtMs;
+                    if (hasStagedQr) {
+                        lastBundleJson = pendingEncryptedQrBundle;
+                        pendingEncryptedQrBundle = "";
+                        pendingEncryptedQrExpiresAtMs = 0L;
+                        status = "QR ready; enter the offline sync passphrase and import";
+                        renderShell();
+                        showQrPanel();
+                    } else {
+                        pendingEncryptedQrBundle = "";
+                        pendingEncryptedQrExpiresAtMs = 0L;
+                        renderShell();
+                    }
                 });
             } catch (Exception e) {
                 Log.e(TAG, "Load failed", e);
-                handler.post(() -> toast("Load failed"));
+                handler.post(() -> {
+                    if (operationGuard.isGenerationCurrent(generation)) toast("Load failed");
+                });
             }
         });
     }
@@ -461,10 +586,12 @@ public class MainActivity extends AppCompatActivity {
         Button add = button("+ New", true);
         Button qr = button("Sync", false);
         Button transfer = button("Import / Export", false);
+        Button autofill = button("Autofill 30s", false);
         Button lockBtn = button("Lock", false);
         primaryActions.addView(add, weight());
         primaryActions.addView(qr, weight());
         secondaryActions.addView(transfer, weight());
+        secondaryActions.addView(autofill, weight());
         secondaryActions.addView(lockBtn, weight());
         actions.addView(primaryActions);
         actions.addView(secondaryActions);
@@ -487,6 +614,7 @@ public class MainActivity extends AppCompatActivity {
         add.setOnClickListener(v -> showAddDialog());
         qr.setOnClickListener(v -> showQrPanel());
         transfer.setOnClickListener(v -> showImportExportPanel());
+        autofill.setOnClickListener(v -> lockForAutofillHandoff());
         lockBtn.setOnClickListener(v -> lock());
     }
 
@@ -525,10 +653,18 @@ public class MainActivity extends AppCompatActivity {
         del.setTextColor(RED);
         d.addView(del);
         del.setOnClickListener(v -> {
-            ioExecutor.execute(() -> {
+            UnlockedVault vault = rustVault;
+            long generation = operationGuard.captureGeneration();
+            if (vault == null || generation == LifecycleOperationGuard.INVALID_TOKEN) return;
+            executeIo(() -> {
                 try {
-                    rustVault.deleteEntry(e.getEntryId());
-                    handler.post(() -> { selectedId = null; loadEntries(); });
+                    if (!operationGuard.isGenerationCurrent(generation)) return;
+                    vault.deleteEntry(e.getEntryId());
+                    handler.post(() -> {
+                        if (!operationGuard.isGenerationCurrent(generation) || rustVault != vault) return;
+                        selectedId = null;
+                        loadEntries();
+                    });
                 } catch (Exception ignored) {}
             });
         });
@@ -560,10 +696,19 @@ public class MainActivity extends AppCompatActivity {
         form.addView(label("Pass")); form.addView(pass);
         new AlertDialog.Builder(this).setTitle("New Entry").setView(form)
                 .setPositiveButton("Save", (d, w) -> {
-                    ioExecutor.execute(() -> {
+                    UnlockedVault vault = rustVault;
+                    long generation = operationGuard.captureGeneration();
+                    String entryTitle = title.getText().toString();
+                    String entryUser = user.getText().toString();
+                    String entryPassword = pass.getText().toString();
+                    if (vault == null || generation == LifecycleOperationGuard.INVALID_TOKEN) return;
+                    executeIo(() -> {
                         try {
-                            rustVault.addEntry(new AddEntryRequest(title.getText().toString(), user.getText().toString(), pass.getText().toString(), "", ""));
-                            handler.post(this::loadEntries);
+                            if (!operationGuard.isGenerationCurrent(generation)) return;
+                            vault.addEntry(new AddEntryRequest(entryTitle, entryUser, entryPassword, "", ""));
+                            handler.post(() -> {
+                                if (operationGuard.isGenerationCurrent(generation) && rustVault == vault) loadEntries();
+                            });
                         } catch (Exception e) {
                             Log.e(TAG, "Save failed", e);
                         }
@@ -598,7 +743,8 @@ public class MainActivity extends AppCompatActivity {
     private void requestAutofillService() {
         Intent intent = new Intent(Settings.ACTION_REQUEST_SET_AUTOFILL_SERVICE,
                 Uri.parse("package:" + getPackageName()));
-        externalFlowInProgress = true;
+        externalFlow.begin(ExternalFlowState.Type.AUTOFILL_SETTINGS,
+                android.os.SystemClock.elapsedRealtime(), EXTERNAL_FLOW_TIMEOUT_MS);
         startActivityForResult(intent, 2601);
     }
 
@@ -655,13 +801,17 @@ public class MainActivity extends AppCompatActivity {
             if (!newValue.equals(confirm.getText().toString())) { toast("New passwords do not match"); return; }
             if (currentValue.equals(newValue)) { toast("New password must be different"); return; }
 
+            long token = operationGuard.beginExclusive(LifecycleOperationGuard.Kind.REKEY);
+            if (token == LifecycleOperationGuard.INVALID_TOKEN) { toast("Another security operation is pending"); return; }
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
             status = "Re-encrypting vault…";
-            ioExecutor.execute(() -> {
+            executeIo(() -> {
                 try {
+                    if (!operationGuard.isCurrent(token, LifecycleOperationGuard.Kind.REKEY)) return;
                     UnlockedVault changed = Fosspass_coreKt.changeMasterPassword(vaultPath, currentValue, newValue);
-                    rustVault = changed;
                     handler.post(() -> {
+                        if (!operationGuard.completeIfCurrent(token, LifecycleOperationGuard.Kind.REKEY)) return;
+                        rustVault = changed;
                         current.setText(""); next.setText(""); confirm.setText("");
                         status = "Master password changed; vault re-encrypted";
                         dialog.dismiss();
@@ -671,6 +821,7 @@ public class MainActivity extends AppCompatActivity {
                 } catch (Exception e) {
                     Log.e(TAG, "Master password change failed", e);
                     handler.post(() -> {
+                        if (!operationGuard.completeIfCurrent(token, LifecycleOperationGuard.Kind.REKEY)) return;
                         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
                         toast("Password change failed: check the current password");
                     });
@@ -710,7 +861,11 @@ public class MainActivity extends AppCompatActivity {
 
     private void beginFidoRegistration() {
         if (rustVault == null) { toast("Unlock the vault before enrolling a key"); return; }
-        pendingFidoChallenge = Fido2HardwareKey.challenge();
+        long token = operationGuard.beginExclusive(LifecycleOperationGuard.Kind.FIDO_REGISTRATION);
+        if (token == LifecycleOperationGuard.INVALID_TOKEN) { toast("Another security operation is pending"); return; }
+        pendingFidoRegistrationToken = token;
+        byte[] challenge = Fido2HardwareKey.challenge();
+        fidoSecrets.setRegistration(challenge, android.os.SystemClock.elapsedRealtime(), FIDO_SECRET_TIMEOUT_MS);
         byte[] userId;
         String savedUserId = securePrefs.getString(PREF_FIDO_USER_ID, null);
         if (savedUserId == null) {
@@ -721,43 +876,94 @@ public class MainActivity extends AppCompatActivity {
             userId = Base64.decode(savedUserId, Base64.DEFAULT);
         }
         Fido.getFido2ApiClient(this)
-                .getRegisterPendingIntent(Fido2HardwareKey.registrationOptions(pendingFidoChallenge, userId))
-                .addOnSuccessListener(pendingIntent -> launchFidoIntent(pendingIntent, REQ_FIDO_REGISTER))
-                .addOnFailureListener(e -> toast("FIDO2 enrollment unavailable: " + e.getMessage()));
+                .getRegisterPendingIntent(Fido2HardwareKey.registrationOptions(challenge, userId))
+                .addOnSuccessListener(pendingIntent -> {
+                    if (operationGuard.isCurrent(token, LifecycleOperationGuard.Kind.FIDO_REGISTRATION))
+                        launchFidoIntent(pendingIntent, REQ_FIDO_REGISTER);
+                })
+                .addOnFailureListener(e -> {
+                    if (!operationGuard.completeIfCurrent(token,
+                            LifecycleOperationGuard.Kind.FIDO_REGISTRATION)) return;
+                    fidoSecrets.clear(FidoPendingSecrets.CleanupReason.API_FAILURE);
+                    pendingFidoRegistrationToken = LifecycleOperationGuard.INVALID_TOKEN;
+                    toast("FIDO2 enrollment unavailable: " + e.getMessage());
+                });
+        Arrays.fill(challenge, (byte) 0);
     }
 
-    private void beginFidoAssertion() {
+    private void beginFidoAssertion(String password, long token) {
         try {
             String encodedId = securePrefs.getString(PREF_FIDO_CREDENTIAL, null);
             if (encodedId == null) throw new IllegalStateException("No hardware credential is enrolled");
             byte[] credentialId = Base64.decode(encodedId, Base64.DEFAULT);
-            pendingFidoChallenge = Fido2HardwareKey.challenge();
+            byte[] challenge = Fido2HardwareKey.challenge();
+            char[] passwordChars = password.toCharArray();
+            fidoSecrets.setAssertion(passwordChars, challenge,
+                    android.os.SystemClock.elapsedRealtime(), FIDO_SECRET_TIMEOUT_MS);
+            Arrays.fill(passwordChars, '\0');
             Fido.getFido2ApiClient(this)
-                    .getSignPendingIntent(Fido2HardwareKey.assertionOptions(pendingFidoChallenge, credentialId))
-                    .addOnSuccessListener(pendingIntent -> launchFidoIntent(pendingIntent, REQ_FIDO_ASSERT))
-                    .addOnFailureListener(e -> toast("FIDO2 authentication unavailable: " + e.getMessage()));
+                    .getSignPendingIntent(Fido2HardwareKey.assertionOptions(challenge, credentialId))
+                    .addOnSuccessListener(pendingIntent -> {
+                        if (operationGuard.isCurrent(token, LifecycleOperationGuard.Kind.UNLOCK))
+                            launchFidoIntent(pendingIntent, REQ_FIDO_ASSERT);
+                    })
+                    .addOnFailureListener(e -> {
+                        if (!operationGuard.completeIfCurrent(token,
+                                LifecycleOperationGuard.Kind.UNLOCK)) return;
+                        fidoSecrets.clear(FidoPendingSecrets.CleanupReason.API_FAILURE);
+                        pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+                        toast("FIDO2 authentication unavailable: " + e.getMessage());
+                    });
+            Arrays.fill(challenge, (byte) 0);
         } catch (Exception e) {
+            fidoSecrets.clear(FidoPendingSecrets.CleanupReason.API_FAILURE);
+            operationGuard.invalidate();
+            pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
             toast("Hardware-key setup is invalid: " + e.getMessage());
         }
     }
 
     private void launchFidoIntent(PendingIntent pendingIntent, int requestCode) {
         try {
-            externalFlowInProgress = true;
+            ExternalFlowState.Type type = requestCode == REQ_FIDO_ASSERT
+                    ? ExternalFlowState.Type.FIDO_ASSERTION : ExternalFlowState.Type.FIDO_REGISTRATION;
+            externalFlow.begin(type, android.os.SystemClock.elapsedRealtime(), EXTERNAL_FLOW_TIMEOUT_MS);
             startIntentSenderForResult(pendingIntent.getIntentSender(), requestCode, null, 0, 0, 0);
+            long token = requestCode == REQ_FIDO_ASSERT ? pendingUnlockToken : pendingFidoRegistrationToken;
+            LifecycleOperationGuard.Kind kind = requestCode == REQ_FIDO_ASSERT
+                    ? LifecycleOperationGuard.Kind.UNLOCK : LifecycleOperationGuard.Kind.FIDO_REGISTRATION;
+            handler.postDelayed(() -> expireFidoContinuation(token, kind), FIDO_SECRET_TIMEOUT_MS);
         } catch (Exception e) {
-            externalFlowInProgress = false;
+            externalFlow.clear();
+            fidoSecrets.clear(FidoPendingSecrets.CleanupReason.LAUNCH_FAILURE);
+            operationGuard.invalidate();
+            pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+            pendingFidoRegistrationToken = LifecycleOperationGuard.INVALID_TOKEN;
             toast("Could not open hardware-key prompt: " + e.getMessage());
         }
     }
 
+    private void expireFidoContinuation(long token, LifecycleOperationGuard.Kind kind) {
+        if (!operationGuard.isCurrent(token, kind)) return;
+        if (fidoSecrets.hasPending(android.os.SystemClock.elapsedRealtime())) return;
+        operationGuard.invalidate();
+        pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+        pendingFidoRegistrationToken = LifecycleOperationGuard.INVALID_TOKEN;
+        externalFlow.clear();
+        VaultSession.clear();
+    }
+
     private void handleFidoRegistrationResult(Intent data) {
+        byte[] challenge = null;
         try {
+            challenge = fidoSecrets.challenge(android.os.SystemClock.elapsedRealtime());
+            if (challenge == null || !operationGuard.completeIfCurrent(pendingFidoRegistrationToken,
+                    LifecycleOperationGuard.Kind.FIDO_REGISTRATION)) throw new SecurityException("Enrollment request expired");
             throwIfFidoError(data);
             byte[] responseBytes = data.getByteArrayExtra(Fido.FIDO2_KEY_RESPONSE_EXTRA);
             if (responseBytes == null) throw new SecurityException("Missing FIDO2 registration response");
             AuthenticatorAttestationResponse response = AuthenticatorAttestationResponse.deserializeFromBytes(responseBytes);
-            Fido2HardwareKey.verifyRegistration(pendingFidoChallenge, response.getClientDataJSON(), response.getAttestationObject());
+            Fido2HardwareKey.verifyRegistration(challenge, response.getClientDataJSON(), response.getAttestationObject());
             PublicKey publicKey = Fido2HardwareKey.extractEs256PublicKey(response.getAttestationObject());
             securePrefs.edit()
                     .putBoolean(PREF_FIDO_ENABLED, true)
@@ -765,18 +971,26 @@ public class MainActivity extends AppCompatActivity {
                     .putString(PREF_FIDO_PUBLIC_KEY, Base64.encodeToString(publicKey.getEncoded(), Base64.NO_WRAP))
                     .putLong(PREF_FIDO_COUNTER, 0)
                     .apply();
-            pendingFidoChallenge = null;
-            status = "FIDO2 hardware key enrolled";
-            renderShell();
-            toast("Hardware key enrolled and required for unlock");
+            status = "FIDO2 hardware key enrolled; vault remains locked";
+            renderUnlock();
+            toast("Hardware key enrolled; unlock again to continue");
         } catch (Exception e) {
             Log.e(TAG, "FIDO2 registration rejected", e);
             toast("Hardware-key enrollment failed: " + e.getMessage());
+        } finally {
+            if (challenge != null) Arrays.fill(challenge, (byte) 0);
+            fidoSecrets.clear(FidoPendingSecrets.CleanupReason.INVALID_RESULT);
+            pendingFidoRegistrationToken = LifecycleOperationGuard.INVALID_TOKEN;
         }
     }
 
     private void handleFidoAssertionResult(Intent data) {
+        char[] password = null;
+        byte[] challenge = null;
         try {
+            challenge = fidoSecrets.challenge(android.os.SystemClock.elapsedRealtime());
+            if (challenge == null || !operationGuard.isCurrent(pendingUnlockToken,
+                    LifecycleOperationGuard.Kind.UNLOCK)) throw new SecurityException("Unlock request expired");
             throwIfFidoError(data);
             byte[] responseBytes = data.getByteArrayExtra(Fido.FIDO2_KEY_RESPONSE_EXTRA);
             if (responseBytes == null) throw new SecurityException("Missing FIDO2 assertion response");
@@ -788,20 +1002,24 @@ public class MainActivity extends AppCompatActivity {
             byte[] encodedKey = Base64.decode(securePrefs.getString(PREF_FIDO_PUBLIC_KEY, ""), Base64.DEFAULT);
             PublicKey publicKey = KeyFactory.getInstance("EC").generatePublic(new X509EncodedKeySpec(encodedKey));
             long oldCounter = securePrefs.getLong(PREF_FIDO_COUNTER, 0);
-            long counter = Fido2HardwareKey.verifyAssertion(publicKey, pendingFidoChallenge,
+            long counter = Fido2HardwareKey.verifyAssertion(publicKey, challenge,
                     response.getClientDataJSON(), response.getAuthenticatorData(), response.getSignature(),
                     Fido2HardwareKey.RP_ID, oldCounter);
             securePrefs.edit().putLong(PREF_FIDO_COUNTER, counter).apply();
-            pendingFidoChallenge = null;
-            String password = pendingUnlockPassword;
-            pendingUnlockPassword = null;
+            password = fidoSecrets.consumeAssertion(android.os.SystemClock.elapsedRealtime());
             if (password == null) throw new SecurityException("Unlock request expired");
-            finishPasswordUnlock(password, pendingCreateVault);
+            String unlockPassword = new String(password);
+            finishPasswordUnlock(unlockPassword, pendingCreateVault, pendingUnlockToken);
         } catch (Exception e) {
-            pendingUnlockPassword = null;
+            fidoSecrets.clear(FidoPendingSecrets.CleanupReason.INVALID_RESULT);
+            operationGuard.invalidate();
+            pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
             recordUnlockFailure();
             Log.e(TAG, "FIDO2 assertion rejected", e);
             toast("Hardware-key authentication failed: " + e.getMessage());
+        } finally {
+            if (password != null) Arrays.fill(password, '\0');
+            if (challenge != null) Arrays.fill(challenge, (byte) 0);
         }
     }
 
@@ -818,7 +1036,8 @@ public class MainActivity extends AppCompatActivity {
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
         intent.putExtra(Intent.EXTRA_MIME_TYPES, PasswordImportFileType.supportedMimeTypes());
-        externalFlowInProgress = true;
+        externalFlow.begin(ExternalFlowState.Type.DOCUMENT_IMPORT,
+                android.os.SystemClock.elapsedRealtime(), EXTERNAL_FLOW_TIMEOUT_MS);
         startActivityForResult(intent, REQ_IMPORT_PASSWORDS);
     }
 
@@ -830,14 +1049,19 @@ public class MainActivity extends AppCompatActivity {
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType(mime);
         intent.putExtra(Intent.EXTRA_TITLE, name);
-        externalFlowInProgress = true;
+        externalFlow.begin(ExternalFlowState.Type.DOCUMENT_EXPORT,
+                android.os.SystemClock.elapsedRealtime(), EXTERNAL_FLOW_TIMEOUT_MS);
         startActivityForResult(intent, REQ_EXPORT_PASSWORDS);
     }
 
     private void importPasswordFile(Uri uri) {
-        ioExecutor.execute(() -> {
+        if (rustVault == null) { toast("Vault locked while choosing file; unlock and retry"); return; }
+        long token = operationGuard.beginExclusive(LifecycleOperationGuard.Kind.IMPORT);
+        if (token == LifecycleOperationGuard.INVALID_TOKEN) { toast("Another security operation is pending"); return; }
+        executeIo(() -> {
             byte[] bytes = null;
             try {
+                if (!operationGuard.isCurrent(token, LifecycleOperationGuard.Kind.IMPORT)) return;
                 try (InputStream in = getContentResolver().openInputStream(uri)) {
                     if (in == null) throw new IllegalStateException("Could not open file");
                     bytes = PasswordImportReader.readBytes(in, PasswordImportReader.MAX_IMPORT_BYTES);
@@ -845,21 +1069,28 @@ public class MainActivity extends AppCompatActivity {
                 if (PasswordImportFileType.isKeePassDatabase(bytes)) {
                     byte[] keepassBytes = bytes;
                     bytes = null;
-                    handler.post(() -> showKeePassPasswordDialog(keepassBytes));
+                    handler.post(() -> {
+                        if (operationGuard.isCurrent(token, LifecycleOperationGuard.Kind.IMPORT))
+                            showKeePassPasswordDialog(keepassBytes, token);
+                        else Arrays.fill(keepassBytes, (byte) 0);
+                    });
                     return;
                 }
                 String content = PasswordImportReader.decodeUtf8(bytes);
-                importParsedEntries(PasswordImportParser.parse(content));
+                importParsedEntries(PasswordImportParser.parse(content), token);
             } catch (Exception e) {
                 Log.e(TAG, "Import failed", e);
-                handler.post(() -> toast("Import failed: " + e.getMessage()));
+                handler.post(() -> {
+                    if (operationGuard.completeIfCurrent(token, LifecycleOperationGuard.Kind.IMPORT))
+                        toast("Import failed: " + e.getMessage());
+                });
             } finally {
                 if (bytes != null) Arrays.fill(bytes, (byte) 0);
             }
         });
     }
 
-    private void showKeePassPasswordDialog(byte[] databaseBytes) {
+    private void showKeePassPasswordDialog(byte[] databaseBytes, long token) {
         LinearLayout form = dialogForm();
         form.addView(infoBox("KeePass database", "Enter the password for this KDB/KDBX database. KeePass key files are not supported yet."));
         EditText password = input("KeePass database password", "", true);
@@ -868,15 +1099,22 @@ public class MainActivity extends AppCompatActivity {
                 .setTitle("Unlock KeePass import")
                 .setView(form)
                 .setPositiveButton("Import", null)
-                .setNegativeButton("Cancel", (d, w) -> Arrays.fill(databaseBytes, (byte) 0))
+                .setNegativeButton("Cancel", (d, w) -> {
+                    Arrays.fill(databaseBytes, (byte) 0);
+                    operationGuard.completeIfCurrent(token, LifecycleOperationGuard.Kind.IMPORT);
+                })
                 .create();
-        dialog.setOnCancelListener(d -> Arrays.fill(databaseBytes, (byte) 0));
+        dialog.setOnCancelListener(d -> {
+            Arrays.fill(databaseBytes, (byte) 0);
+            operationGuard.completeIfCurrent(token, LifecycleOperationGuard.Kind.IMPORT);
+        });
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             String databasePassword = password.getText().toString();
             password.setText("");
             dialog.dismiss();
-            ioExecutor.execute(() -> {
+            executeIo(() -> {
                 try {
+                    if (!operationGuard.isCurrent(token, LifecycleOperationGuard.Kind.IMPORT)) return;
                     List<AddEntryRequest> requests = Fosspass_coreKt.parseKeepassDatabase(databaseBytes, databasePassword);
                     List<PasswordImportParser.ImportedEntry> parsedEntries = new ArrayList<>();
                     for (AddEntryRequest request : requests) {
@@ -884,10 +1122,13 @@ public class MainActivity extends AppCompatActivity {
                                 request.getTitle(), request.getUsername(), request.getPassword(),
                                 request.getUrl(), request.getNotes()));
                     }
-                    importParsedEntries(parsedEntries);
+                    importParsedEntries(parsedEntries, token);
                 } catch (Exception e) {
                     Log.e(TAG, "KeePass import failed", e);
-                    handler.post(() -> toast("KeePass import failed: " + e.getMessage()));
+                    handler.post(() -> {
+                        if (operationGuard.completeIfCurrent(token, LifecycleOperationGuard.Kind.IMPORT))
+                            toast("KeePass import failed: " + e.getMessage());
+                    });
                 } finally {
                     Arrays.fill(databaseBytes, (byte) 0);
                 }
@@ -896,7 +1137,8 @@ public class MainActivity extends AppCompatActivity {
         dialog.show();
     }
 
-    private void importParsedEntries(List<PasswordImportParser.ImportedEntry> parsedEntries) throws Exception {
+    private void importParsedEntries(List<PasswordImportParser.ImportedEntry> parsedEntries, long token) throws Exception {
+        if (!operationGuard.isCurrent(token, LifecycleOperationGuard.Kind.IMPORT) || rustVault == null) return;
         List<PasswordImportParser.ImportedEntry> existingEntries = new ArrayList<>();
         for (PublicEntry entry : rustVault.listEntries()) {
             existingEntries.add(new PasswordImportParser.ImportedEntry(
@@ -913,6 +1155,7 @@ public class MainActivity extends AppCompatActivity {
         int skipped = plan.exactDuplicatesSkipped;
         int reused = plan.reusedPasswordsDetected;
         handler.post(() -> {
+            if (!operationGuard.completeIfCurrent(token, LifecycleOperationGuard.Kind.IMPORT)) return;
             status = "Imported " + imported + " entries · skipped " + skipped + " exact duplicates"
                     + (reused > 0 ? " · warning: " + reused + " reused passwords" : "");
             loadEntries();
@@ -920,18 +1163,32 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void exportPasswordFile(Uri uri, String format) {
-        ioExecutor.execute(() -> {
+        UnlockedVault vault = rustVault;
+        long generation = operationGuard.captureGeneration();
+        if (vault == null || generation == LifecycleOperationGuard.INVALID_TOKEN) {
+            toast("Vault locked while choosing export location; unlock and retry");
+            return;
+        }
+        executeIo(() -> {
             try {
-                List<PublicEntry> snapshot = rustVault.listEntries();
+                if (!operationGuard.isGenerationCurrent(generation)) return;
+                List<PublicEntry> snapshot = vault.listEntries();
                 String content = format.equals("json") ? exportJson(snapshot) : exportCsv(snapshot);
                 try (OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
                     if (out == null) throw new IllegalStateException("Could not create file");
                     out.write(content.getBytes(StandardCharsets.UTF_8));
                 }
-                handler.post(() -> { status = "Exported " + snapshot.size() + " entries as " + format.toUpperCase(Locale.ROOT); renderShell(); });
+                handler.post(() -> {
+                    if (!operationGuard.isGenerationCurrent(generation) || rustVault != vault) return;
+                    status = "Exported " + snapshot.size() + " entries as " + format.toUpperCase(Locale.ROOT);
+                    renderShell();
+                });
             } catch (Exception e) {
                 Log.e(TAG, "Export failed", e);
-                handler.post(() -> toast("Export failed: " + e.getMessage()));
+                handler.post(() -> {
+                    if (operationGuard.isGenerationCurrent(generation))
+                        toast("Export failed: " + e.getMessage());
+                });
             }
         });
     }
@@ -1055,8 +1312,9 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showQrPanel() {
+        stopQrExportAnimation();
         LinearLayout form = dialogForm();
-        form.addView(infoBox("Rust Sync", "AES-GCM encrypted QR bundle. Uses Argon2id for sync key derivation."));
+        form.addView(infoBox("Easy encrypted sync", "Small transfers use one QR. Large vaults use one automatically changing tile: point the other camera once and hold still; do not scan each frame manually."));
         Button scan = button("Scan QR", false);
         form.addView(scan);
         EditText syncPass = input("Sync Passphrase", pendingSyncPassphrase, true);
@@ -1065,7 +1323,7 @@ public class MainActivity extends AppCompatActivity {
         ImageView qr = new ImageView(this);
         qr.setPadding(0, dp(12), 0, dp(12));
         form.addView(qr, new LinearLayout.LayoutParams(-1, dp(300)));
-        TextView frameStatus = text("Export creates scanner-compatible frames for large vaults.", 12, MUTED, false);
+        TextView frameStatus = text("Export creates one QR when the encrypted vault fits.", 12, MUTED, false);
         frameStatus.setGravity(Gravity.CENTER_HORIZONTAL);
         form.addView(frameStatus);
         LinearLayout frameNavigation = row();
@@ -1094,19 +1352,33 @@ public class MainActivity extends AppCompatActivity {
                     toast("Use an 8+ character offline sync passphrase");
                     return;
                 }
-                ioExecutor.execute(() -> {
+                UnlockedVault vault = rustVault;
+                long generation = operationGuard.captureGeneration();
+                if (vault == null || generation == LifecycleOperationGuard.INVALID_TOKEN) return;
+                executeIo(() -> {
                     try {
-                        String b = rustVault.exportAndroidCompatibleBundle(passphrase, "fosspass-qr-sync-v1");
-                        List<String> frames = QrSyncSupport.splitAndroidBundle(
-                                b, 700, UUID.randomUUID().toString());
+                        if (!operationGuard.isGenerationCurrent(generation)) return;
+                        String b = vault.exportAndroidCompatibleBundle(passphrase, "fosspass-qr-sync-v1");
+                        List<String> frames;
+                        if (b.length() <= SINGLE_QR_MAX_CHARS) {
+                            frames = new ArrayList<>();
+                            frames.add(b);
+                        } else {
+                            frames = QrSyncSupport.splitAndroidBundle(
+                                    b, 1_000, UUID.randomUUID().toString());
+                        }
                         handler.post(() -> {
+                            if (!operationGuard.isGenerationCurrent(generation) || rustVault != vault) return;
                             try {
                                 lastBundleJson = b;
                                 qrExportFrames = frames;
                                 qrExportIndex = 0;
                                 bundle.setText(b);
                                 showQrExportFrame(qr, frameStatus);
-                                toast("Encrypted export ready: scan all " + frames.size() + " frame(s)");
+                                startQrExportAnimation(qr, frameStatus);
+                                toast(frames.size() == 1
+                                        ? "Single encrypted QR ready — scan once"
+                                        : "One-scan transfer ready — hold the other camera on this tile");
                             } catch (Exception e) {
                                 Log.e(TAG, "QR generate failed", e);
                                 toast("QR generation failed: " + e.getMessage());
@@ -1114,35 +1386,43 @@ public class MainActivity extends AppCompatActivity {
                         });
                     } catch (Exception e) {
                         Log.e(TAG, "Export failed", e);
-                        handler.post(() -> toast("Export failed"));
+                        handler.post(() -> {
+                            if (operationGuard.isGenerationCurrent(generation)) toast("Export failed");
+                        });
                     }
                 });
             });
 
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
                 String pass = syncPass.getText().toString();
-                String data = bundle.getText().toString();
-                if (pass.isEmpty() || data.isEmpty()) { toast("Need passphrase and data"); return; }
-                ioExecutor.execute(() -> {
+                String data;
+                try {
+                    data = QrSyncSupport.requireCompleteAndroidBundle(bundle.getText().toString());
+                } catch (IllegalArgumentException error) {
+                    toast(error.getMessage());
+                    return;
+                }
+                if (pass.isEmpty()) { toast("Need sync passphrase"); return; }
+                UnlockedVault vault = rustVault;
+                long generation = operationGuard.captureGeneration();
+                if (vault == null || generation == LifecycleOperationGuard.INVALID_TOKEN) return;
+                executeIo(() -> {
                     try {
-                        // Try both formats: Android Compatible and Qubes frame format
-                        ImportReport report;
-                        if (data.trim().startsWith("[")) {
-                            // Raw list import - wrap it if needed or handle as direct JSON import
-                            // For now, assume it's the encrypted bundle format
-                            report = rustVault.importAndroidCompatibleBundle(data, pass);
-                        } else {
-                            report = rustVault.importAndroidCompatibleBundle(data, pass);
-                        }
-                        
+                        if (!operationGuard.isGenerationCurrent(generation)) return;
+                        ImportReport report = vault.importAndroidCompatibleBundle(data, pass);
+
                         handler.post(() -> {
+                            if (!operationGuard.isGenerationCurrent(generation) || rustVault != vault) return;
                             toast("Imported " + report.getImportedEntries() + " entries");
                             dialog.dismiss();
                             loadEntries();
                         });
                     } catch (Exception e) {
                         Log.e(TAG, "QR Import failed", e);
-                        handler.post(() -> toast("Import failed: " + e.getMessage()));
+                        handler.post(() -> {
+                            if (operationGuard.isGenerationCurrent(generation))
+                                toast("Import failed: " + e.getMessage());
+                        });
                     }
                 });
             });
@@ -1150,25 +1430,26 @@ public class MainActivity extends AppCompatActivity {
         
         previousFrame.setOnClickListener(v -> {
             if (qrExportFrames.isEmpty()) return;
+            stopQrExportAnimation();
             qrExportIndex = (qrExportIndex - 1 + qrExportFrames.size()) % qrExportFrames.size();
             showQrExportFrame(qr, frameStatus);
         });
         nextFrame.setOnClickListener(v -> {
             if (qrExportFrames.isEmpty()) return;
-            qrExportIndex = (qrExportIndex + 1) % qrExportFrames.size();
+            stopQrExportAnimation();
+            qrExportIndex = QrSyncSupport.nextFrameIndex(qrExportIndex, qrExportFrames.size());
             showQrExportFrame(qr, frameStatus);
         });
 
         scan.setOnClickListener(v -> {
-            pendingSyncPassphrase = syncPass.getText().toString();
-            if (pendingSyncPassphrase.isEmpty()) {
-                toast("Enter sync passphrase before scanning");
-                return;
-            }
+            pendingSyncPassphrase = "";
             dialog.dismiss();
-            externalFlowInProgress = true;
+            externalFlow.begin(ExternalFlowState.Type.QR_SCAN,
+                    android.os.SystemClock.elapsedRealtime(), EXTERNAL_FLOW_TIMEOUT_MS);
             startActivityForResult(new Intent(this, QrScannerActivity.class), REQ_QR_SCAN);
+            toast("Scan the code once and keep the camera pointed until import is captured");
         });
+        dialog.setOnDismissListener(ignored -> stopQrExportAnimation());
         dialog.show();
     }
 
@@ -1181,8 +1462,10 @@ public class MainActivity extends AppCompatActivity {
         qrExportIndex = Math.max(0, Math.min(qrExportIndex, qrExportFrames.size() - 1));
         try {
             qr.setImageBitmap(qrBitmap(qrExportFrames.get(qrExportIndex), 800));
-            frameStatus.setText("Frame " + (qrExportIndex + 1) + " / " + qrExportFrames.size()
-                    + " — scan every frame; order does not matter");
+            frameStatus.setText(qrExportFrames.size() == 1
+                    ? "Single QR — scan once"
+                    : "Automatic frame " + (qrExportIndex + 1) + " / " + qrExportFrames.size()
+                            + " — keep the camera pointed here; no manual scanning");
         } catch (Exception e) {
             qr.setImageDrawable(null);
             frameStatus.setText("Could not render QR frame");
@@ -1190,30 +1473,73 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void startQrExportAnimation(ImageView qr, TextView frameStatus) {
+        stopQrExportAnimation();
+        if (qrExportFrames.size() < 2) return;
+        qrExportAnimation = new Runnable() {
+            @Override public void run() {
+                if (qrExportFrames.size() < 2) return;
+                qrExportIndex = QrSyncSupport.nextFrameIndex(qrExportIndex, qrExportFrames.size());
+                showQrExportFrame(qr, frameStatus);
+                handler.postDelayed(this, QR_ANIMATION_MS);
+            }
+        };
+        handler.postDelayed(qrExportAnimation, QR_ANIMATION_MS);
+    }
+
+    private void stopQrExportAnimation() {
+        if (qrExportAnimation != null) handler.removeCallbacks(qrExportAnimation);
+        qrExportAnimation = null;
+    }
+
+    private void executeIo(Runnable task) {
+        if (operationGuard.captureGeneration() == LifecycleOperationGuard.INVALID_TOKEN) return;
+        try {
+            ioExecutor.execute(task);
+        } catch (RejectedExecutionException ignored) {
+            // Shutdown races are expected during destruction; never report into dead UI.
+        }
+    }
+
     private void lock() {
+        stopQrExportAnimation();
+        operationGuard.invalidate();
+        pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+        pendingFidoRegistrationToken = LifecycleOperationGuard.INVALID_TOKEN;
+        fidoSecrets.clear(FidoPendingSecrets.CleanupReason.CANCELLATION);
+        externalFlow.clear();
         VaultSession.clear();
-        clearUnlockedState();
+        clearUnlockedState(false);
     }
 
     private void lockForAutofillHandoff() {
-        if (rustVault != null) VaultSession.handoff(rustVault, 30_000L);
-        else VaultSession.clear();
-        clearUnlockedState();
+        if (rustVault == null) { toast("Unlock the vault before starting autofill handoff"); return; }
+        externalFlow.begin(ExternalFlowState.Type.AUTOFILL_HANDOFF,
+                android.os.SystemClock.elapsedRealtime(), 30_000L);
+        operationGuard.invalidate();
+        fidoSecrets.clear(FidoPendingSecrets.CleanupReason.CANCELLATION);
+        VaultSession.handoff(rustVault, 30_000L);
+        clearUnlockedState(false);
+        toast("Autofill handoff active once for 30 seconds");
     }
 
-    private void clearUnlockedState() {
+    private void clearUnlockedState(boolean preserveFidoContinuation) {
         rustVault = null;
         entries.clear();
         selectedId = null;
-        pendingUnlockPassword = null;
-        pendingFidoChallenge = null;
+        if (!preserveFidoContinuation) {
+            pendingUnlockToken = LifecycleOperationGuard.INVALID_TOKEN;
+            pendingFidoRegistrationToken = LifecycleOperationGuard.INVALID_TOKEN;
+        }
         pendingSyncPassphrase = "";
         lastBundleJson = "";
         qrExportFrames = new ArrayList<>();
         qrExportIndex = 0;
         clearClipboard();
-        if (securePrefs != null) renderUnlock();
-        else renderFatalSecurityError();
+        if (!isDestroyed()) {
+            if (securePrefs != null) renderUnlock();
+            else renderFatalSecurityError();
+        }
     }
 
     private void copySecret(String value) {
@@ -1242,11 +1568,16 @@ public class MainActivity extends AppCompatActivity {
         return entries.isEmpty() ? null : entries.get(0);
     }
 
-    private void showBiometricPrompt(Runnable onSuccess) {
+    private void showBiometricPrompt(Runnable onSuccess, Runnable onCancelled) {
         BiometricPrompt prompt = new BiometricPrompt(this, ContextCompat.getMainExecutor(this), new BiometricPrompt.AuthenticationCallback() {
             @Override public void onAuthenticationSucceeded(@NonNull BiometricPrompt.AuthenticationResult result) {
                 super.onAuthenticationSucceeded(result);
                 onSuccess.run();
+            }
+
+            @Override public void onAuthenticationError(int errorCode, @NonNull CharSequence errString) {
+                super.onAuthenticationError(errorCode, errString);
+                onCancelled.run();
             }
         });
         prompt.authenticate(new BiometricPrompt.PromptInfo.Builder().setTitle("FossPass").setNegativeButtonText("Cancel")

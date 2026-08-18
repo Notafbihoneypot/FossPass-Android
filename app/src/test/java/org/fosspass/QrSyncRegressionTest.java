@@ -89,6 +89,68 @@ public class QrSyncRegressionTest {
         assertEquals(bundle, complete);
     }
 
+    @Test
+    public void androidQrCollectorAcceptsDesktopChunkSize1000() throws Exception {
+        String bundle = "{\"type\":\"fosspass-qr-sync-v1\",\"ciphertext\":\""
+                + "x".repeat(7_500) + "\"}";
+        List<String> frames = QrSyncSupport.splitAndroidBundle(bundle, 1_000, "desktop-1000");
+        QrSyncSupport.AndroidQrFrameCollector collector =
+                new QrSyncSupport.AndroidQrFrameCollector();
+        String complete = null;
+        for (int index = 1; index < frames.size(); index += 2) complete = collector.add(frames.get(index));
+        for (int index = 0; index < frames.size(); index += 2) complete = collector.add(frames.get(index));
+        assertEquals(bundle, complete);
+    }
+
+    @Test
+    public void scannerClassificationRejectsDesktopOnlyAndUnrelatedFossPassFrames() throws Exception {
+        assertEquals(QrSyncSupport.ScannedQrKind.DESKTOP_ONLY_FRAME,
+                QrSyncSupport.classifyScannedQr(new JSONObject("{\"type\":\"fosspass-qr-frame\"}")));
+        assertEquals(QrSyncSupport.ScannedQrKind.UNSUPPORTED_FOSSPASS,
+                QrSyncSupport.classifyScannedQr(new JSONObject("{\"type\":\"fosspass-other-v9\"}")));
+        assertEquals(QrSyncSupport.ScannedQrKind.ANDROID_FRAME,
+                QrSyncSupport.classifyScannedQr(new JSONObject("{\"type\":\"fosspass-android-qr-frame-v1\"}")));
+        assertEquals(QrSyncSupport.ScannedQrKind.ANDROID_BUNDLE,
+                QrSyncSupport.classifyScannedQr(new JSONObject("{\"type\":\"fosspass-qr-sync-v1\"}")));
+        assertEquals(QrSyncSupport.ScannedQrKind.UNRELATED,
+                QrSyncSupport.classifyScannedQr(new JSONObject("{\"type\":\"some-other-qr\"}")));
+    }
+
+    @Test
+    public void stagedQrImportAcceptsOnlyCompleteAndroidEncryptedBundles() {
+        String valid = "{\"type\":\"fosspass-qr-sync-v1\",\"version\":3,\"compression\":\"zlib\","
+                + "\"salt\":\"AAAAAAAAAAAAAAAAAAAAAA==\",\"iv\":\"AAAAAAAAAAAAAAAA\","
+                + "\"ciphertext\":\"AAAAAAAAAAAAAAAAAAAAAA==\"}";
+        assertTrue(QrSyncSupport.isStagedAndroidBundle(valid));
+        assertFalse(QrSyncSupport.isStagedAndroidBundle("{\"type\":\"fosspass-qr-frame\"}"));
+        assertFalse(QrSyncSupport.isStagedAndroidBundle("{\"type\":\"fosspass-qr-sync-v1\",\"ciphertext\":\"AAAA\"}"));
+        assertFalse(QrSyncSupport.isStagedAndroidBundle("not-json"));
+    }
+
+    @Test
+    public void importValidationReturnsCompleteBundleAndRejectsIndividualFramesBeforeRust() throws Exception {
+        String valid = "{\"type\":\"fosspass-qr-sync-v1\",\"version\":3,\"compression\":\"zlib\","
+                + "\"salt\":\"AAAAAAAAAAAAAAAAAAAAAA==\",\"iv\":\"AAAAAAAAAAAAAAAA\","
+                + "\"ciphertext\":\"AAAAAAAAAAAAAAAAAAAAAA==\"}";
+        assertEquals(valid, QrSyncSupport.requireCompleteAndroidBundle("  " + valid + "  "));
+
+        IllegalArgumentException frameError = assertThrows(IllegalArgumentException.class,
+                () -> QrSyncSupport.requireCompleteAndroidBundle(
+                        "{\"type\":\"fosspass-android-qr-frame-v1\",\"frame_index\":0}"));
+        assertTrue(frameError.getMessage().contains("Scan QR"));
+        IllegalArgumentException desktopError = assertThrows(IllegalArgumentException.class,
+                () -> QrSyncSupport.requireCompleteAndroidBundle(
+                        "{\"type\":\"fosspass-qr-frame\"}"));
+        assertTrue(desktopError.getMessage().contains("desktop-only"));
+    }
+
+    @Test
+    public void animatedQrNavigationLoopsWithoutManualNextPresses() {
+        assertEquals(1, QrSyncSupport.nextFrameIndex(0, 4));
+        assertEquals(0, QrSyncSupport.nextFrameIndex(3, 4));
+        assertEquals(0, QrSyncSupport.nextFrameIndex(0, 0));
+    }
+
     private static String frame(String id, int index, int count, String payload, String digest) {
         return "{\"type\":\"fosspass-android-qr-frame-v1\",\"version\":1,"
                 + "\"bundle_id\":\"" + id + "\",\"frame_index\":" + index

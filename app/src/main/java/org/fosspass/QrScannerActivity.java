@@ -4,8 +4,13 @@ import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.ImageFormat;
+import android.graphics.Color;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Size;
+import android.view.Gravity;
+import android.widget.FrameLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
@@ -38,17 +43,34 @@ public class QrScannerActivity extends AppCompatActivity {
     public static final String EXTRA_QR_VALUE = "org.fosspass.QR_VALUE";
     private static final int PERMISSION_REQUEST_CAMERA = 1001;
     private PreviewView previewView;
+    private TextView scannerStatus;
     private ExecutorService cameraExecutor;
     private final MultiFormatReader qrReader = new MultiFormatReader();
     private final QrSyncSupport.AndroidQrFrameCollector frameCollector =
             new QrSyncSupport.AndroidQrFrameCollector();
     private boolean finished = false;
+    private String lastStatus = "";
+    private long lastStatusAtMs;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().setFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE, android.view.WindowManager.LayoutParams.FLAG_SECURE);
+        FrameLayout cameraLayout = new FrameLayout(this);
         previewView = new PreviewView(this);
-        setContentView(previewView);
+        cameraLayout.addView(previewView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        scannerStatus = new TextView(this);
+        scannerStatus.setText("Point at the FossPass QR once and hold still");
+        scannerStatus.setTextColor(Color.WHITE);
+        scannerStatus.setBackgroundColor(0xB3000000);
+        scannerStatus.setGravity(Gravity.CENTER);
+        scannerStatus.setPadding(24, 16, 24, 16);
+        FrameLayout.LayoutParams statusParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM);
+        statusParams.setMargins(24, 24, 24, 48);
+        cameraLayout.addView(scannerStatus, statusParams);
+        setContentView(cameraLayout);
         cameraExecutor = Executors.newSingleThreadExecutor();
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera();
         else ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, PERMISSION_REQUEST_CAMERA);
@@ -103,9 +125,20 @@ public class QrScannerActivity extends AppCompatActivity {
 
     private void handleQr(String raw) throws Exception {
         JSONObject object = new JSONObject(raw);
-        if (!"fosspass-android-qr-frame-v1".equals(object.optString("type"))) {
-            returnQr(raw);
-            return;
+        switch (QrSyncSupport.classifyScannedQr(object)) {
+            case ANDROID_BUNDLE:
+                returnQr(raw);
+                return;
+            case DESKTOP_ONLY_FRAME:
+                showScannerStatus("Desktop-only QR. On FossPass desktop choose Sync with Android.");
+                return;
+            case UNSUPPORTED_FOSSPASS:
+                showScannerStatus("Unsupported FossPass QR. Scan an Android sync QR.");
+                return;
+            case UNRELATED:
+                return;
+            case ANDROID_FRAME:
+                break;
         }
         int before = frameCollector.scannedCount();
         String complete = frameCollector.add(raw);
@@ -114,10 +147,16 @@ public class QrScannerActivity extends AppCompatActivity {
         } else if (frameCollector.scannedCount() > before) {
             int scanned = frameCollector.scannedCount();
             int expected = frameCollector.expectedCount();
-            runOnUiThread(() -> Toast.makeText(this,
-                    "Frame " + scanned + " / " + expected + " scanned — show the next QR",
-                    Toast.LENGTH_SHORT).show());
+            showScannerStatus("Scanning animated QR: " + scanned + " / " + expected);
         }
+    }
+
+    private void showScannerStatus(String message) {
+        long now = SystemClock.elapsedRealtime();
+        if (message.equals(lastStatus) && now - lastStatusAtMs < 2_000) return;
+        lastStatus = message;
+        lastStatusAtMs = now;
+        runOnUiThread(() -> scannerStatus.setText(message));
     }
 
     private void returnQr(String value) {
