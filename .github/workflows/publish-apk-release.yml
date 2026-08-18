@@ -1,0 +1,32 @@
+name: Publish Android APK release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v4
+
+      - name: Verify packaged APK checksum
+        working-directory: apks
+        run: sha256sum --check SHA256SUMS
+
+      - name: Publish prerelease assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            apks/FossPass-0.4.0-alpha-sync-storage-arm64-debug.apk \
+            apks/SHA256SUMS \
+            --verify-tag \
+            --prerelease \
+            --title "FossPass 0.4.0 alpha — encrypted sync and storage picker" \
+            --notes "Android arm64-v8a prerelease. Debug-signed for testing only. Adds a database-location picker, compressed Android/Qubes sync, one-scan QR collection, and hardened lifecycle handling."

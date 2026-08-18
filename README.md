@@ -1,17 +1,31 @@
 # FossPass Android
 
+Offline-first encrypted Android password vault with Qubes interoperability.
+
 Current build: `0.4.0-alpha-sync-storage` (`versionCode 6`).
+
+## Download
+
+- Architecture: Android `arm64-v8a`
+- Signing: debug/test key — prerelease testing only
+- APK: [FossPass 0.4.0 alpha](apks/FossPass-0.4.0-alpha-sync-storage-arm64-debug.apk)
+- SHA-256: `45f1840590c653e246a3285ea49cfd576fca5c8cf698bc53383276b8b217562b`
+
+> This is a debug-signed alpha build. Do not treat it as a production release. A production APK must be signed with a protected release key and tested on physical devices.
 
 ## Implemented
 
 - Rust/UniFFI vault core using Argon2id and XChaCha20-Poly1305.
 - Vault create, unlock, master-password change, entries, imports, exports, and encrypted QR sync.
+- One direct QR for small encrypted bundles and one automatically changing QR tile for large vaults.
 - `BIOMETRIC_STRONG`, FIDO2 roaming-key support, `FLAG_SECURE`, clipboard sensitivity metadata, and automatic clipboard clearing.
 - StrongBox-backed encrypted preferences when verified; encrypted Android Keystore fallback when StrongBox is unavailable. The app fails closed if encrypted preferences cannot initialize.
 - Persistent exponential unlock throttling capped at 60 seconds.
 - Android Autofill Service with a 30-second in-memory handoff and a fresh `BIOMETRIC_STRONG` confirmation before one credential is released. Decrypted Autofill data is never persisted.
 - Choose the encrypted database location from the unlock screen: private internal storage (recommended) or app-scoped device storage. Locations remain separate encrypted vaults and switching does not copy records.
-- No `INTERNET` permission.
+- Password-manager imports for supported JSON, CSV, KeePass XML, and KDBX exports.
+- Android backup disabled and cleartext network traffic disabled.
+- No broad storage permission and no `INTERNET` permission.
 
 ## Autofill workflow
 
@@ -31,7 +45,6 @@ export ANDROID_SDK_ROOT="$ANDROID_HOME"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
 export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$PATH"
 
-# Build the Rust core for every packaged ABI.
 cd crates/fosspass-core
 cargo test
 cargo build --release
@@ -50,15 +63,13 @@ Canonical debug APK:
 
 `app/build/outputs/apk/debug/app-debug.apk`
 
-Physical-device verification is still required for UI, Autofill integration, biometrics, StrongBox, QR camera, and roaming FIDO2 behavior.
+Physical-device verification is still required for UI, storage switching, Autofill integration, biometrics, StrongBox, QR camera, and roaming FIDO2 behavior.
 
 ## Qubes desktop interoperability
 
-The matching Qubes/Tauri desktop app is at:
+The matching source repository is [FossPass-Qubes](https://github.com/Notafbihoneypot/FossPass-Qubes).
 
-`/home/user/fosspass_debug/fosspass_tauri_qubes_fixed`
-
-Both applications implement the same camera-less encrypted transfer format:
+Both applications implement the same encrypted transfer format:
 
 - `fosspass-qr-sync-v1` and `fosspass-vault-file-v1`
 - Argon2id: 32 MiB, 2 iterations, parallelism 1
